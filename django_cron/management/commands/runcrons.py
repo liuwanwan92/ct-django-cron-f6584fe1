@@ -41,24 +41,32 @@ class Command(BaseCommand):
         else:
             cron_class_names = getattr(settings, 'CRON_CLASSES', [])
 
-        try:
-            crons_to_run = [get_class(x) for x in cron_class_names]
-        except ImportError:
-            error = traceback.format_exc()
-            self.stdout.write(
-                'ERROR: Make sure these are valid cron class names: %s\n\n%s'
-                % (cron_class_names, error)
-            )
-            return
+        for cron_class_name in cron_class_names:
+            try:
+                cron_class = get_class(cron_class_name)
+            except Exception:
+                error = traceback.format_exc()
+                self.stdout.write(
+                    'ERROR: Make sure this is a valid cron class name: %s\n\n%s'
+                    % (cron_class_name, error)
+                )
+                continue
 
-        for cron_class in crons_to_run:
-            run_cron_with_cache_check(
-                cron_class,
-                force=options['force'],
-                silent=options['silent'],
-                dry_run=options['dry_run'],
-                stdout=self.stdout,
-            )
+            try:
+                run_cron_with_cache_check(
+                    cron_class,
+                    force=options['force'],
+                    silent=options['silent'],
+                    dry_run=options['dry_run'],
+                    stdout=self.stdout,
+                )
+            except Exception:
+                error = traceback.format_exc()
+                self.stdout.write(
+                    'ERROR: Failed to run cron %s:\n\n%s'
+                    % (cron_class_name, error)
+                )
+                continue
 
         clear_old_log_entries()
         close_old_connections()

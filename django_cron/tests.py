@@ -92,7 +92,7 @@ class TestRunCrons(TransactionTestCase):
 
     def test_not_exists_cron(self):
         response = self._call(self.does_not_exist_cron, force=True)
-        self.assertIn('Make sure these are valid cron class names', response)
+        self.assertIn('Make sure this is a valid cron class name', response)
         self.assertIn(self.does_not_exist_cron, response)
         self.assertEqual(CronJobLog.objects.all().count(), 0)
 
@@ -370,3 +370,158 @@ class TestCronLoop(TransactionTestCase):
             cron_classes=[self.success_cron, self.success_cron], repeat=2, sleep=1
         )
         self.assertEqual(CronJobLog.objects.all().count(), 4)
+
+
+class TestTimezoneHandling(TransactionTestCase):
+
+    five_mins_cron = 'test_crons.Test5minsCronJob'
+    run_at_times_cron = 'test_crons.TestRunAtTimesCronJob'
+    run_on_wkend_cron = 'test_crons.RunOnWeekendCronJob'
+    run_on_month_days = 'test_crons.RunOnMonthDaysCronJob'
+    retry_cron = 'test_crons.TestRetryAfterFailureCronJob'
+
+    def setUp(self):
+        CronJobLog.objects.all().delete()
+
+    def _call(self, *args, **kwargs):
+        return call('runcrons', *args, **kwargs)
+
+    @override_settings(USE_TZ=True, TIME_ZONE='US/Eastern')
+    def test_run_every_mins_with_tz(self):
+        with freeze_time("2024-01-15 12:00:00"):
+            self._call(self.five_mins_cron)
+        self.assertEqual(CronJobLog.objects.count(), 1)
+
+        with freeze_time("2024-01-15 12:04:59"):
+            self._call(self.five_mins_cron)
+        self.assertEqual(CronJobLog.objects.count(), 1)
+
+        with freeze_time("2024-01-15 12:05:01"):
+            self._call(self.five_mins_cron)
+        self.assertEqual(CronJobLog.objects.count(), 2)
+
+    @override_settings(USE_TZ=True, TIME_ZONE='US/Eastern')
+    def test_run_at_times_with_tz(self):
+        with freeze_time("2024-01-15 05:00:01"):
+            self._call(self.run_at_times_cron)
+        self.assertEqual(CronJobLog.objects.count(), 1)
+
+        with freeze_time("2024-01-15 05:04:50"):
+            self._call(self.run_at_times_cron)
+        self.assertEqual(CronJobLog.objects.count(), 1)
+
+        with freeze_time("2024-01-15 05:05:01"):
+            self._call(self.run_at_times_cron)
+        self.assertEqual(CronJobLog.objects.count(), 2)
+
+    @override_settings(USE_TZ=True, TIME_ZONE='US/Eastern')
+    def test_run_weekly_on_days_with_tz(self):
+        with freeze_time("2024-06-15 12:00:00"):
+            self._call(self.run_on_wkend_cron)
+        self.assertEqual(CronJobLog.objects.count(), 1)
+
+        with freeze_time("2024-06-17 12:00:00"):
+            self._call(self.run_on_wkend_cron)
+        self.assertEqual(CronJobLog.objects.count(), 1)
+
+    @override_settings(USE_TZ=True, TIME_ZONE='US/Eastern')
+    def test_run_monthly_on_days_with_tz(self):
+        with freeze_time("2024-01-10 12:00:00"):
+            self._call(self.run_on_month_days)
+        self.assertEqual(CronJobLog.objects.count(), 1)
+
+        with freeze_time("2024-01-11 12:00:00"):
+            self._call(self.run_on_month_days)
+        self.assertEqual(CronJobLog.objects.count(), 1)
+
+    @override_settings(USE_TZ=True, TIME_ZONE='US/Eastern')
+    def test_dst_transition_spring_forward(self):
+        with freeze_time("2024-03-10 06:00:00"):
+            self._call(self.five_mins_cron)
+        self.assertEqual(CronJobLog.objects.count(), 1)
+
+        with freeze_time("2024-03-10 06:04:59"):
+            self._call(self.five_mins_cron)
+        self.assertEqual(CronJobLog.objects.count(), 1)
+
+        with freeze_time("2024-03-10 06:05:01"):
+            self._call(self.five_mins_cron)
+        self.assertEqual(CronJobLog.objects.count(), 2)
+
+    @override_settings(USE_TZ=True, TIME_ZONE='US/Eastern')
+    def test_retry_after_failure_with_tz(self):
+        with freeze_time("2024-01-15 12:00:00"):
+            self._call(self.retry_cron)
+        self.assertEqual(CronJobLog.objects.count(), 1)
+        self.assertFalse(CronJobLog.objects.first().is_success)
+
+        with freeze_time("2024-01-15 12:02:00"):
+            self._call(self.retry_cron)
+        self.assertEqual(CronJobLog.objects.count(), 1)
+
+        with freeze_time("2024-01-15 12:06:00"):
+            self._call(self.retry_cron)
+        self.assertEqual(CronJobLog.objects.count(), 2)
+
+
+class TestRetryInterval(TransactionTestCase):
+
+    retry_cron = 'test_crons.TestRetryAfterFailureCronJob'
+
+    def setUp(self):
+        CronJobLog.objects.all().delete()
+
+    def _call(self, *args, **kwargs):
+        return call('runcrons', *args, **kwargs)
+
+    def test_retry_after_failure_respects_interval(self):
+        with freeze_time("2024-01-15 12:00:00"):
+            self._call(self.retry_cron)
+        self.assertEqual(CronJobLog.objects.count(), 1)
+        self.assertFalse(CronJobLog.objects.first().is_success)
+
+        with freeze_time("2024-01-15 12:02:00"):
+            self._call(self.retry_cron)
+        self.assertEqual(CronJobLog.objects.count(), 1)
+
+        with freeze_time("2024-01-15 12:06:00"):
+            self._call(self.retry_cron)
+        self.assertEqual(CronJobLog.objects.count(), 2)
+
+
+class TestTaskIsolation(TransactionTestCase):
+
+    success_cron = 'test_crons.TestSuccessCronJob'
+    error_cron = 'test_crons.TestErrorCronJob'
+
+    def setUp(self):
+        CronJobLog.objects.all().delete()
+
+    def _call(self, *args, **kwargs):
+        return call('runcrons', *args, **kwargs)
+
+    def test_bad_import_does_not_block_others(self):
+        response = self._call(
+            self.success_cron,
+            'nonexistent.module.BadCron',
+            force=True,
+        )
+        self.assertEqual(
+            CronJobLog.objects.filter(code='test_success_cron_job').count(), 1
+        )
+        self.assertIn('ERROR', response)
+
+    def test_bad_import_between_valid_crons(self):
+        response = self._call(
+            self.success_cron,
+            'nonexistent.module.BadCron',
+            self.error_cron,
+            force=True,
+        )
+        self.assertEqual(
+            CronJobLog.objects.filter(code='test_success_cron_job').count(), 1
+        )
+        self.assertEqual(
+            CronJobLog.objects.filter(code='test_error_cron_job').count(), 1
+        )
+        self.assertIn('ERROR', response)

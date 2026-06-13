@@ -89,3 +89,11 @@ class RunEveryMinuteAndRemoveOldLogs(CronJobBase):
 
     def do(self):
         pass
+
+
+class TestRetryAfterFailureCronJob(CronJobBase):
+    code = 'test_retry_after_failure'
+    schedule = Schedule(run_every_mins=60, retry_after_failure_mins=5)
+
+    def do(self):
+        raise Exception("intentional failure")
