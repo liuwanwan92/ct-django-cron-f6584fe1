@@ -89,3 +89,35 @@ class RunEveryMinuteAndRemoveOldLogs(CronJobBase):
 
     def do(self):
         pass
+
+
+class RunEvery5MinsWithRetryCronJob(CronJobBase):
+    code = 'test_run_every_5_with_retry'
+    schedule = Schedule(run_every_mins=5, retry_after_failure_mins=10)
+
+    def do(self):
+        pass
+
+
+class RunEvery5MinsRetryFailCronJob(CronJobBase):
+    code = 'test_run_every_5_with_retry'
+    schedule = Schedule(run_every_mins=5, retry_after_failure_mins=10)
+
+    def do(self):
+        raise Exception('retry test failure')
+
+
+class RunAtTimeWithRetryCronJob(CronJobBase):
+    code = 'test_run_at_time_retry'
+    schedule = Schedule(run_at_times=['10:00'], retry_after_failure_mins=30)
+
+    def do(self):
+        pass
+
+
+class AlwaysFailCronJob(CronJobBase):
+    code = 'always_fail_for_isolation'
+    schedule = Schedule(run_every_mins=0)
+
+    def do(self):
+        raise RuntimeError('intentional failure for batch-isolation test')

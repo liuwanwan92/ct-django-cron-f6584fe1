@@ -1,4 +1,5 @@
 from __future__ import print_function
+import logging
 import traceback
 from datetime import timedelta
 
@@ -11,6 +12,7 @@ from django_cron.models import CronJobLog
 
 
 DEFAULT_LOCK_TIME = 24 * 60 * 60  # 24 hours
+logger = logging.getLogger('django_cron')
 
 
 class Command(BaseCommand):
@@ -52,13 +54,20 @@ class Command(BaseCommand):
             return
 
         for cron_class in crons_to_run:
-            run_cron_with_cache_check(
-                cron_class,
-                force=options['force'],
-                silent=options['silent'],
-                dry_run=options['dry_run'],
-                stdout=self.stdout,
-            )
+            try:
+                run_cron_with_cache_check(
+                    cron_class,
+                    force=options['force'],
+                    silent=options['silent'],
+                    dry_run=options['dry_run'],
+                    stdout=self.stdout,
+                )
+            except Exception:
+                logger.error(
+                    'Unexpected error running cron %s:\n%s',
+                    cron_class.__name__,
+                    traceback.format_exc(),
+                )
 
         clear_old_log_entries()
         close_old_connections()
@@ -84,8 +93,18 @@ def run_cron_with_cache_check(
 
 def clear_old_log_entries():
     """
-    Removes older log entries, if the appropriate setting has been set
+    Removes older log entries, if the appropriate setting has been set.
+
+    Tolerates legacy rows whose *end_time* was written before timezone
+    support was enabled (naive datetimes mixed with aware ones).
     """
     if hasattr(settings, 'DJANGO_CRON_DELETE_LOGS_OLDER_THAN'):
         delta = timedelta(days=settings.DJANGO_CRON_DELETE_LOGS_OLDER_THAN)
-        CronJobLog.objects.filter(end_time__lt=get_current_time() - delta).delete()
+        try:
+            CronJobLog.objects.filter(end_time__lt=get_current_time() - delta).delete()
+        except TypeError:
+            # Fallback when legacy naive rows can't be compared with the
+            # current aware cutoff (or vice-versa).  Delete conservatively
+            # using a raw SQL date comparison that doesn't care about offset.
+            cutoff = (get_current_time() - delta).replace(tzinfo=None)
+            CronJobLog.objects.filter(end_time__lt=cutoff).delete()

@@ -1,4 +1,5 @@
-from django.utils.timezone import now as utc_now, localtime, is_naive
+from django.conf import settings
+from django.utils import timezone
 from django.utils.translation import gettext as _
 from django.template.defaultfilters import pluralize
 
@@ -48,5 +49,41 @@ def get_class(kls):
 
 
 def get_current_time():
-    now = utc_now()
-    return now if is_naive(now) else localtime(now)
+    """
+    Returns the current time in the project's configured timezone.
+
+    When ``USE_TZ=True``, returns a timezone-aware datetime in the active
+    timezone (``settings.TIME_ZONE`` or per-request override).
+    When ``USE_TZ=False``, returns a naive datetime in local time.
+    """
+    now = timezone.now()
+    if timezone.is_naive(now):
+        return now
+    return timezone.localtime(now)
+
+
+def normalize_datetime(dt):
+    """
+    Ensures *dt* matches the project's timezone-awareness setting so that
+    it can be safely compared with values produced by :func:`get_current_time`.
+
+    * ``USE_TZ=True``  → always returns an aware datetime.
+      Naive datetimes (e.g. from legacy log rows written before timezone
+      support was enabled) are interpreted as belonging to the current
+      timezone.
+    * ``USE_TZ=False`` → always returns a naive datetime.
+      Aware datetimes are converted to naive local time first.
+    """
+    if dt is None:
+        return None
+
+    use_tz = getattr(settings, 'USE_TZ', False)
+
+    if use_tz:
+        if timezone.is_naive(dt):
+            return timezone.make_aware(dt, timezone.get_current_timezone())
+        return dt
+    else:
+        if timezone.is_aware(dt):
+            return timezone.make_naive(dt, timezone.get_current_timezone())
+        return dt

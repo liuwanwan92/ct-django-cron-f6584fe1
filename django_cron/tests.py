@@ -15,7 +15,7 @@ from django.test.client import Client
 from django.urls import reverse
 from django.contrib.auth.models import User
 
-from django_cron.helpers import humanize_duration
+from django_cron.helpers import humanize_duration, normalize_datetime
 from django_cron.models import CronJobLog, CronJobLock
 import test_crons
 
@@ -357,6 +357,289 @@ class TestRunCrons(TransactionTestCase):
             call_command('runcrons', self.five_mins_cron)
             self.assertEqual(CronJobLog.objects.all().count(), 2)
             self.assertEqual(CronJobLog.objects.all().earliest('start_time').end_time, mock_date_in_past)
+
+
+class TestTimezoneAwareScheduling(TransactionTestCase):
+    """
+    Verify that scheduling logic works correctly when ``USE_TZ=True``
+    and the project timezone is *not* UTC.
+
+    Before the fix, ``datetime.today()`` (naive) was compared with
+    timezone-aware datetimes from the DB, causing ``TypeError``.
+    """
+
+    retry_cron = 'test_crons.RunEvery5MinsWithRetryCronJob'
+    retry_fail_cron = 'test_crons.RunEvery5MinsRetryFailCronJob'
+    five_mins_cron = 'test_crons.Test5minsCronJob'
+    run_at_times_cron = 'test_crons.TestRunAtTimesCronJob'
+    run_on_wkend_cron = 'test_crons.RunOnWeekendCronJob'
+
+    def setUp(self):
+        CronJobLog.objects.all().delete()
+
+    # ---- interval-based scheduling with USE_TZ=True ----
+
+    @override_settings(USE_TZ=True, TIME_ZONE='America/New_York')
+    def test_run_every_mins_with_tz_non_utc(self):
+        """Interval scheduling works when TIME_ZONE is not UTC."""
+        with freeze_time('2024-06-15 10:00:00-04:00'):  # EDT
+            call_command('runcrons', self.five_mins_cron)
+        self.assertEqual(CronJobLog.objects.count(), 1)
+
+        # 4 min later — too early
+        with freeze_time('2024-06-15 10:04:00-04:00'):
+            call_command('runcrons', self.five_mins_cron)
+        self.assertEqual(CronJobLog.objects.count(), 1)
+
+        # 6 min later — should run
+        with freeze_time('2024-06-15 10:06:00-04:00'):
+            call_command('runcrons', self.five_mins_cron)
+        self.assertEqual(CronJobLog.objects.count(), 2)
+
+    @override_settings(USE_TZ=True, TIME_ZONE='Asia/Shanghai')
+    def test_run_every_mins_with_far_east_tz(self):
+        """Interval scheduling works with a +8h offset timezone."""
+        with freeze_time('2024-06-15 10:00:00+08:00'):  # CST
+            call_command('runcrons', self.five_mins_cron)
+        self.assertEqual(CronJobLog.objects.count(), 1)
+
+        with freeze_time('2024-06-15 10:06:00+08:00'):
+            call_command('runcrons', self.five_mins_cron)
+        self.assertEqual(CronJobLog.objects.count(), 2)
+
+    # ---- historical naive log compatibility ----
+
+    @override_settings(USE_TZ=True, TIME_ZONE='America/New_York')
+    def test_interval_with_naive_historical_log(self):
+        """
+        A naive ``start_time`` left over from before ``USE_TZ=True`` must
+        not cause a ``TypeError`` when the scheduler reads it back.
+        """
+        naive_time = datetime.datetime(2024, 6, 15, 10, 0, 0)
+        CronJobLog.objects.create(
+            code='test_run_every_mins',
+            start_time=naive_time,
+            end_time=naive_time,
+            is_success=True,
+        )
+
+        with freeze_time('2024-06-15 10:10:00-04:00'):
+            call_command('runcrons', self.five_mins_cron)
+        self.assertEqual(CronJobLog.objects.count(), 2)
+
+    @override_settings(USE_TZ=True, TIME_ZONE='America/New_York')
+    def test_run_at_times_with_naive_historical_log(self):
+        """
+        ``run_at_times`` queries must tolerate naive historical rows.
+        """
+        naive_time = datetime.datetime(2024, 1, 1, 0, 0, 0)
+        CronJobLog.objects.create(
+            code='test_run_at_times',
+            start_time=naive_time,
+            end_time=naive_time,
+            is_success=True,
+            ran_at_time='0:00',
+        )
+
+        # Different day — historical log shouldn't block today's run
+        with freeze_time('2024-01-02 00:05:00-05:00'):  # EST
+            call_command('runcrons', self.run_at_times_cron)
+        self.assertEqual(CronJobLog.objects.count(), 2)
+
+    # ---- retry-after-failure with mixed datetime types ----
+
+    @override_settings(USE_TZ=True, TIME_ZONE='America/New_York')
+    def test_retry_with_naive_historical_log(self):
+        """
+        Retry logic must not crash when the latest failure log is naive
+        (pre-``USE_TZ``).
+        """
+        naive_time = datetime.datetime(2024, 6, 15, 10, 0, 0)
+        CronJobLog.objects.create(
+            code='test_run_every_5_with_retry',
+            start_time=naive_time,
+            end_time=naive_time,
+            is_success=False,
+        )
+
+        # 15 min later — past 10-min retry window → should run
+        with freeze_time('2024-06-15 10:15:00-04:00'):
+            call_command('runcrons', self.retry_cron)
+        self.assertEqual(CronJobLog.objects.count(), 2)
+
+    @override_settings(USE_TZ=True, TIME_ZONE='America/New_York')
+    def test_retry_within_window_with_aware_log(self):
+        """
+        Inside the retry window the job must be suppressed.
+        """
+        with freeze_time('2024-06-15 10:00:00-04:00'):
+            call_command('runcrons', self.retry_fail_cron)
+        self.assertEqual(CronJobLog.objects.count(), 1)
+        self.assertFalse(CronJobLog.objects.first().is_success)
+
+        # 5 min later — still inside the 10-min retry window
+        with freeze_time('2024-06-15 10:05:00-04:00'):
+            call_command('runcrons', self.retry_cron)
+        self.assertEqual(CronJobLog.objects.count(), 1)
+
+    @override_settings(USE_TZ=True, TIME_ZONE='America/New_York')
+    def test_retry_after_window_with_aware_log(self):
+        """
+        Past the retry window the job must run again.
+        """
+        with freeze_time('2024-06-15 10:00:00-04:00'):
+            call_command('runcrons', self.retry_fail_cron)
+        self.assertEqual(CronJobLog.objects.count(), 1)
+
+        # 15 min later — past 10-min retry window
+        with freeze_time('2024-06-15 10:15:00-04:00'):
+            call_command('runcrons', self.retry_cron)
+        self.assertEqual(CronJobLog.objects.count(), 2)
+
+    # ---- DST transitions ----
+
+    @override_settings(USE_TZ=True, TIME_ZONE='America/New_York')
+    def test_interval_across_spring_forward_dst(self):
+        """
+        Interval cron across spring-forward (2024-03-10 02:00 → 03:00 EDT).
+        The job must still run when enough *real* time has elapsed.
+        """
+        # Before DST gap (EST = UTC-5)
+        with freeze_time('2024-03-10 01:30:00-05:00'):
+            call_command('runcrons', self.five_mins_cron)
+        self.assertEqual(CronJobLog.objects.count(), 1)
+
+        # After DST gap (EDT = UTC-4, 03:30 EDT = 07:30 UTC)
+        with freeze_time('2024-03-10 03:30:00-04:00'):
+            call_command('runcrons', self.five_mins_cron)
+        self.assertEqual(CronJobLog.objects.count(), 2)
+
+    @override_settings(USE_TZ=True, TIME_ZONE='America/New_York')
+    def test_interval_across_fall_back_dst(self):
+        """
+        Interval cron across fall-back (2024-11-03 02:00 → 01:00 EST).
+        """
+        # Before fall-back (EDT = UTC-4)
+        with freeze_time('2024-11-03 00:30:00-04:00'):
+            call_command('runcrons', self.five_mins_cron)
+        self.assertEqual(CronJobLog.objects.count(), 1)
+
+        # After fall-back (EST = UTC-5)
+        with freeze_time('2024-11-03 01:30:00-05:00'):
+            call_command('runcrons', self.five_mins_cron)
+        self.assertEqual(CronJobLog.objects.count(), 2)
+
+    # ---- weekly / monthly day checks with USE_TZ ----
+
+    @override_settings(USE_TZ=True, TIME_ZONE='America/New_York')
+    def test_weekly_day_check_with_tz(self):
+        """Weekly day filter uses the configured timezone, not OS local."""
+        # Saturday in America/New_York (EDT)
+        with freeze_time('2024-06-15 12:00:00-04:00'):  # Saturday
+            call_command('runcrons', self.run_on_wkend_cron)
+        self.assertEqual(CronJobLog.objects.count(), 1)
+
+        # Monday
+        with freeze_time('2024-06-17 12:00:00-04:00'):
+            call_command('runcrons', self.run_on_wkend_cron)
+        self.assertEqual(CronJobLog.objects.count(), 1)
+
+    # ---- normalize_datetime helper ----
+
+    @override_settings(USE_TZ=True, TIME_ZONE='America/New_York')
+    def test_normalize_datetime_makes_naive_aware(self):
+        from django.utils import timezone as tz
+        naive = datetime.datetime(2024, 6, 15, 12, 0, 0)
+        result = normalize_datetime(naive)
+        self.assertTrue(tz.is_aware(result))
+
+    @override_settings(USE_TZ=True, TIME_ZONE='America/New_York')
+    def test_normalize_datetime_keeps_aware(self):
+        from django.utils import timezone as tz
+        aware = tz.make_aware(
+            datetime.datetime(2024, 6, 15, 12, 0, 0),
+            tz.get_current_timezone(),
+        )
+        result = normalize_datetime(aware)
+        self.assertTrue(tz.is_aware(result))
+        self.assertEqual(result, aware)
+
+    @override_settings(USE_TZ=False)
+    def test_normalize_datetime_strips_tz_when_use_tz_false(self):
+        from django.utils import timezone as tz
+        aware = tz.make_aware(
+            datetime.datetime(2024, 6, 15, 12, 0, 0),
+            tz.get_current_timezone(),
+        )
+        result = normalize_datetime(aware)
+        self.assertTrue(tz.is_naive(result))
+
+    @override_settings(USE_TZ=True, TIME_ZONE='UTC')
+    def test_normalize_datetime_none_returns_none(self):
+        self.assertIsNone(normalize_datetime(None))
+
+    # ---- USE_TZ=False backward compatibility ----
+
+    @override_settings(USE_TZ=False)
+    def test_run_every_mins_without_tz(self):
+        """Interval scheduling still works with USE_TZ=False."""
+        with freeze_time('2024-06-15 10:00:00'):
+            call_command('runcrons', self.five_mins_cron)
+        self.assertEqual(CronJobLog.objects.count(), 1)
+
+        with freeze_time('2024-06-15 10:06:00'):
+            call_command('runcrons', self.five_mins_cron)
+        self.assertEqual(CronJobLog.objects.count(), 2)
+
+
+class TestBatchIsolation(TransactionTestCase):
+    """
+    One cron's failure must never prevent other crons in the same batch
+    from executing.
+    """
+
+    fail_cron = 'test_crons.AlwaysFailCronJob'
+    success_cron = 'test_crons.TestSuccessCronJob'
+
+    def setUp(self):
+        CronJobLog.objects.all().delete()
+
+    def test_failing_cron_does_not_block_success(self):
+        """A failure in one cron must not prevent the next from running."""
+        out_buffer = OutBuffer()
+        call_command(
+            'runcrons',
+            self.fail_cron,
+            self.success_cron,
+            stdout=out_buffer,
+        )
+        # Both jobs produced output
+        logs = CronJobLog.objects.all()
+        self.assertEqual(logs.count(), 2)
+        self.assertEqual(
+            logs.filter(code='always_fail_for_isolation', is_success=False).count(),
+            1,
+        )
+        self.assertEqual(
+            logs.filter(code='test_success_cron_job', is_success=True).count(),
+            1,
+        )
+
+    def test_failing_cron_first_does_not_block_second(self):
+        """Even when the failing cron is first, the second still runs."""
+        out_buffer = OutBuffer()
+        call_command(
+            'runcrons',
+            self.fail_cron,
+            self.success_cron,
+            stdout=out_buffer,
+        )
+        self.assertEqual(
+            CronJobLog.objects.filter(is_success=True).count(), 1
+        )
+        self.assertEqual(
+            CronJobLog.objects.filter(is_success=False).count(), 1
+        )
 
 
 class TestCronLoop(TransactionTestCase):

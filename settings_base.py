@@ -13,6 +13,10 @@ INSTALLED_APPS = [
 
 SECRET_KEY = "wknfgl34qtnjo&Yk3jqfjtn2k3jtnk4wtnk"
 
+# Explicitly disable timezone support for backward-compatible tests.
+# New timezone-aware tests use @override_settings(USE_TZ=True).
+USE_TZ = False
+
 
 CRON_CLASSES = [
     'test_crons.TestSuccessCronJob',
