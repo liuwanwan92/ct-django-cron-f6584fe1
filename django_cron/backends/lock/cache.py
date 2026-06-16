@@ -23,12 +23,11 @@ class CacheLock(DjangoCronJobLock):
     def lock(self):
         """
         This method sets a cache variable to mark current job as "already running".
+        Uses cache.add() which is atomic — only succeeds if key does not already
+        exist, eliminating the TOCTOU race of a separate get/set pair.
         """
-        if self.cache.get(self.lock_name):
-            return False
-        else:
-            self.cache.set(self.lock_name, timezone.now(), self.timeout)
-            return True
+        added = self.cache.add(self.lock_name, timezone.now(), self.timeout)
+        return added
 
     def release(self):
         self.cache.delete(self.lock_name)

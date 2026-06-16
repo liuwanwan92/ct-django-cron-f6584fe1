@@ -14,9 +14,13 @@ from django.test.utils import override_settings
 from django.test.client import Client
 from django.urls import reverse
 from django.contrib.auth.models import User
+from django.utils import timezone
 
+from django_cron import CronJobManager
 from django_cron.helpers import humanize_duration
 from django_cron.models import CronJobLog, CronJobLock
+from django_cron.backends.lock.cache import CacheLock
+from django_cron.backends.lock.database import DatabaseLock
 import test_crons
 
 
@@ -62,6 +66,7 @@ class TestRunCrons(TransactionTestCase):
     )
     run_on_month_days = 'test_crons.RunOnMonthDaysCronJob'
     run_and_remove_old_logs = 'test_crons.RunEveryMinuteAndRemoveOldLogs'
+    short_lock_timeout_cron = 'test_crons.TestShortLockTimeoutCronJob'
 
     def _call(self, *args, **kwargs):
         return call('runcrons', *args, **kwargs)
@@ -357,6 +362,199 @@ class TestRunCrons(TransactionTestCase):
             call_command('runcrons', self.five_mins_cron)
             self.assertEqual(CronJobLog.objects.all().count(), 2)
             self.assertEqual(CronJobLog.objects.all().earliest('start_time').end_time, mock_date_in_past)
+
+
+class TestLockingFixes(TransactionTestCase):
+    """Tests for lock atomicity, stale-lock recovery, and log correctness."""
+
+    success_cron = 'test_crons.TestSuccessCronJob'
+    error_cron = 'test_crons.TestErrorCronJob'
+    wait_3sec_cron = 'test_crons.Wait3secCronJob'
+    short_lock_timeout_cron = 'test_crons.TestShortLockTimeoutCronJob'
+
+    def _call(self, *args, **kwargs):
+        return call('runcrons', *args, **kwargs)
+
+    def setUp(self):
+        CronJobLog.objects.all().delete()
+        CronJobLock.objects.all().delete()
+
+    # ------------------------------------------------------------------ #
+    # CacheLock atomicity                                                 #
+    # ------------------------------------------------------------------ #
+
+    def test_cache_lock_uses_atomic_add(self):
+        """CacheLock.lock() must use cache.add() (atomic), not get()/set()."""
+        cron_class = test_crons.TestSuccessCronJob
+        lock = CacheLock(cron_class, silent=True)
+        with patch.object(lock.cache, 'add', wraps=lock.cache.add) as mock_add:
+            result = lock.lock()
+            self.assertTrue(result)
+            mock_add.assert_called_once()
+            lock.release()
+
+    def test_cache_lock_concurrent_threads_single_execution(self):
+        """Two threads starting almost simultaneously must produce exactly one log."""
+        def run_in_thread():
+            self._call(self.wait_3sec_cron)
+            db.close_old_connections()
+
+        t1 = threading.Thread(target=run_in_thread)
+        t2 = threading.Thread(target=run_in_thread)
+        t1.daemon = True
+        t2.daemon = True
+        t1.start()
+        sleep(0.05)  # tiny gap — second thread should be blocked by lock
+        t2.start()
+        t1.join(15)
+        t2.join(15)
+        # Only one execution should have succeeded
+        self.assertEqual(CronJobLog.objects.filter(is_success=True).count(), 1)
+
+    # ------------------------------------------------------------------ #
+    # DatabaseLock stale-lock recovery                                    #
+    # ------------------------------------------------------------------ #
+
+    @override_settings(
+        DJANGO_CRON_LOCK_BACKEND='django_cron.backends.lock.database.DatabaseLock'
+    )
+    def test_database_lock_stale_lock_is_overridden(self):
+        """A lock whose locked_at has exceeded the timeout must be acquirable."""
+        job_name = '.'.join([
+            test_crons.TestShortLockTimeoutCronJob.__module__,
+            test_crons.TestShortLockTimeoutCronJob.__name__,
+        ])
+        # Simulate a stale lock from a crashed process (10 s ago, timeout = 1 s)
+        CronJobLock.objects.create(
+            job_name=job_name,
+            locked=True,
+            locked_at=timezone.now() - timedelta(seconds=10),
+        )
+        # The lock should be overridden and the job should execute
+        self._call(self.short_lock_timeout_cron, force=True)
+        self.assertEqual(CronJobLog.objects.count(), 1)
+        # Lock must be released after the run
+        lock_row = CronJobLock.objects.get(job_name=job_name)
+        self.assertFalse(lock_row.locked)
+        self.assertIsNone(lock_row.locked_at)
+
+    @override_settings(
+        DJANGO_CRON_LOCK_BACKEND='django_cron.backends.lock.database.DatabaseLock'
+    )
+    def test_database_lock_active_lock_is_respected(self):
+        """A lock that has NOT expired must block acquisition."""
+        job_name = '.'.join([
+            test_crons.TestShortLockTimeoutCronJob.__module__,
+            test_crons.TestShortLockTimeoutCronJob.__name__,
+        ])
+        # Freshly acquired lock (locked_at = now, timeout = 1 s) — not stale
+        CronJobLock.objects.create(
+            job_name=job_name,
+            locked=True,
+            locked_at=timezone.now(),
+        )
+        # The lock should block the run — no log should be created
+        self._call(self.short_lock_timeout_cron, force=True)
+        self.assertEqual(CronJobLog.objects.count(), 0)
+
+    @override_settings(
+        DJANGO_CRON_LOCK_BACKEND='django_cron.backends.lock.database.DatabaseLock'
+    )
+    def test_database_lock_release_is_idempotent(self):
+        """release() must not crash when the lock row is missing or already unlocked."""
+        cron_class = test_crons.TestSuccessCronJob
+        lock = DatabaseLock(cron_class, silent=True)
+        # Case 1: no lock row exists at all
+        lock.release()  # should not raise
+        # Case 2: row exists but locked=False
+        job_name = '.'.join([cron_class.__module__, cron_class.__name__])
+        CronJobLock.objects.create(job_name=job_name, locked=False, locked_at=None)
+        lock.release()  # should not raise
+
+    @override_settings(
+        DJANGO_CRON_LOCK_BACKEND='django_cron.backends.lock.database.DatabaseLock'
+    )
+    def test_database_lock_acquired_lock_has_timestamp(self):
+        """Acquiring a lock must set locked_at to the current time."""
+        cron_class = test_crons.TestSuccessCronJob
+        lock = DatabaseLock(cron_class, silent=True)
+        before = timezone.now()
+        self.assertTrue(lock.lock())
+        after = timezone.now()
+        job_name = '.'.join([cron_class.__module__, cron_class.__name__])
+        lock_row = CronJobLock.objects.get(job_name=job_name)
+        self.assertTrue(lock_row.locked)
+        self.assertIsNotNone(lock_row.locked_at)
+        self.assertGreaterEqual(lock_row.locked_at, before)
+        self.assertLessEqual(lock_row.locked_at, after)
+        lock.release()
+
+    # ------------------------------------------------------------------ #
+    # Error recovery — lock released after failure                        #
+    # ------------------------------------------------------------------ #
+
+    def test_lock_released_after_error_allows_rerun(self):
+        """After a cron job fails, the lock must be released so the next run can proceed."""
+        self._call(self.error_cron, force=True)
+        self.assertEqual(CronJobLog.objects.count(), 1)
+        self.assertFalse(CronJobLog.objects.first().is_success)
+        # A subsequent run should succeed (lock was released)
+        self._call(self.success_cron, force=True)
+        self.assertEqual(CronJobLog.objects.count(), 2)
+        self.assertTrue(
+            CronJobLog.objects.filter(code='test_success_cron_job', is_success=True).exists()
+        )
+
+    # ------------------------------------------------------------------ #
+    # No false "Job in progress" success log                              #
+    # ------------------------------------------------------------------ #
+
+    def test_no_intermediate_job_in_progress_log(self):
+        """A successful run must produce exactly ONE log entry, not a transient
+        'Job in progress' record followed by the final one."""
+        self._call(self.success_cron, force=True)
+        logs = CronJobLog.objects.filter(code='test_success_cron_job')
+        self.assertEqual(logs.count(), 1)
+        log = logs.first()
+        self.assertTrue(log.is_success)
+        # The message must NOT be the old "Job in progress" placeholder
+        self.assertNotIn('Job in progress', log.message)
+
+    # ------------------------------------------------------------------ #
+    # Manual (--force) and scheduled runs coexistence                     #
+    # ------------------------------------------------------------------ #
+
+    def test_force_run_does_not_create_extra_log(self):
+        """Force-running a cron twice must leave exactly one success log per run
+        (no extra 'Job in progress' ghost entries)."""
+        self._call(self.success_cron, force=True)
+        self._call(self.success_cron, force=True)
+        logs = CronJobLog.objects.filter(code='test_success_cron_job', is_success=True)
+        # Two force-runs → two success logs (remove_successful_cron_logs is False by default).
+        # The critical assertion: no "Job in progress" placeholder logs.
+        self.assertEqual(logs.count(), 2)
+        for log in logs:
+            self.assertNotIn('Job in progress', log.message)
+
+    def test_force_run_resets_interval_for_scheduled_run(self):
+        """A --force run writes a success log; the next scheduled check should
+        see that log and skip (not run again within the interval)."""
+        with freeze_time("2014-01-01 00:00:00"):
+            # Force-run the 5-minute cron
+            self._call('test_crons.Test5minsCronJob', force=True)
+            self.assertEqual(CronJobLog.objects.count(), 1)
+
+        with freeze_time("2014-01-01 00:02:00"):
+            # 2 minutes later — should NOT run (interval is 5 mins)
+            response = self._call('test_crons.Test5minsCronJob')
+            self.assertIn('[ ]', response)
+            self.assertEqual(CronJobLog.objects.count(), 1)
+
+        with freeze_time("2014-01-01 00:06:00"):
+            # 6 minutes after the force-run — should run now
+            response = self._call('test_crons.Test5minsCronJob')
+            self.assertIn(u'\N{HEAVY CHECK MARK}', response)
+            self.assertEqual(CronJobLog.objects.count(), 2)
 
 
 class TestCronLoop(TransactionTestCase):

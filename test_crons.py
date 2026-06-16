@@ -89,3 +89,13 @@ class RunEveryMinuteAndRemoveOldLogs(CronJobBase):
 
     def do(self):
         pass
+
+
+class TestShortLockTimeoutCronJob(CronJobBase):
+    """Used to test stale lock detection with a 1-second lock timeout."""
+    code = 'test_short_lock_timeout'
+    schedule = Schedule(run_every_mins=0)
+    DJANGO_CRON_LOCK_TIME = 1
+
+    def do(self):
+        pass
